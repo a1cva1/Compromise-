@@ -42,23 +42,37 @@ jobs:
         run: |
           choco install ngrok --no-progress -y
           
-          # Fixed the path to Chocolatey bin folder
+          # Token config
           & "C:\ProgramData\chocolatey\bin\ngrok.exe" config add-authtoken "${{ inputs.ngrok_auth_token }}".Trim()
-          Start-Process "C:\ProgramData\chocolatey\bin\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
-          Start-Sleep -Seconds 7
           
-          $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
-          $ngrok_url = $tunnels.tunnels[0].public_url
-          $clean_url = $ngrok_url -replace "tcp://", ""
+          # Starting Ngrok and forcing it to save errors in a log file
+          Start-Process "C:\ProgramData\chocolatey\bin\ngrok.exe" -ArgumentList "tcp 3389 --log=D:\ngrok.log" -WindowStyle Hidden
+          Start-Sleep -Seconds 10
           
-          Write-Host "================================================--"
-          Write-Host "🟢 RDP IS READY TO CONNECT!"
-          Write-Host "🖥️ RDP Address: $clean_url"
-          Write-Host "👤 Username: $env:RDP_USER"
-          Write-Host "🔑 Password: $env:RDP_PASS"
-          Write-Host "================================================--"
-          
-          "NGROK_ADDRESS=$clean_url" | Out-File -Append $env:GITHUB_ENV
+          try {
+            $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+            $ngrok_url = $tunnels.tunnels[0].public_url
+            $clean_url = $ngrok_url -replace "tcp://", ""
+            
+            Write-Host "================================================--"
+            Write-Host "🟢 RDP IS READY TO CONNECT!"
+            Write-Host "🖥️ RDP Address: $clean_url"
+            Write-Host "👤 Username: $env:RDP_USER"
+            Write-Host "🔑 Password: $env:RDP_PASS"
+            Write-Host "================================================--"
+            
+            "NGROK_ADDRESS=$clean_url" | Out-File -Append $env:GITHUB_ENV
+          } catch {
+            Write-Host "--------------------------------------------------"
+            Write-Host "❌ NGROK FAILED TO START! PRINTING THE EXACT ERROR BELOW:"
+            Write-Host "--------------------------------------------------"
+            if (Test-Path "D:\ngrok.log") {
+              Get-Content "D:\ngrok.log"
+            } else {
+              Write-Host "Ngrok didn't even output any logs. Check your Authtoken."
+            }
+            exit 1
+          }
 
       - name: Keep Alive Loop
         run: |
