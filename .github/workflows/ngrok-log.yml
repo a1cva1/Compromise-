@@ -41,8 +41,10 @@ jobs:
       - name: Launch Ngrok Tunnel
         run: |
           choco install ngrok --no-progress -y
-          & "C:\Program Files\ngrok\ngrok.exe" config add-authtoken "${{ inputs.ngrok_auth_token }}".Trim()
-          Start-Process "C:\Program Files\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
+          
+          # Fixed the path to Chocolatey bin folder
+          & "C:\ProgramData\chocolatey\bin\ngrok.exe" config add-authtoken "${{ inputs.ngrok_auth_token }}".Trim()
+          Start-Process "C:\ProgramData\chocolatey\bin\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
           Start-Sleep -Seconds 7
           
           $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
