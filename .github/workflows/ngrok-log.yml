@@ -1,0 +1,67 @@
+name: Ngrok RDP (No Telegram - Logs Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ngrok_auth_token:   { description: "Paste your Ngrok Authtoken", required: true }
+      runtime_minutes:    { description: "Runtime in minutes (max 360)", required: false, default: "355" }
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+
+    steps:
+      - name: Runtime Setup
+        run: |
+          $rt = [int]"${{ inputs.runtime_minutes }}"; if ($rt -lt 5) { $rt = 355 }
+          "RUNTIME_MINUTES=$rt" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Configure Windows RDP
+        run: |
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) { 
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember "Administrators" $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Launch Ngrok Tunnel
+        run: |
+          choco install ngrok --no-progress -y
+          & "C:\Program Files\ngrok\ngrok.exe" config add-authtoken "${{ inputs.ngrok_auth_token }}".Trim()
+          Start-Process "C:\Program Files\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
+          Start-Sleep -Seconds 7
+          
+          $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
+          $ngrok_url = $tunnels.tunnels[0].public_url
+          $clean_url = $ngrok_url -replace "tcp://", ""
+          
+          Write-Host "================================================--"
+          Write-Host "🟢 RDP IS READY TO CONNECT!"
+          Write-Host "🖥️ RDP Address: $clean_url"
+          Write-Host "👤 Username: $env:RDP_USER"
+          Write-Host "🔑 Password: $env:RDP_PASS"
+          Write-Host "================================================--"
+          
+          "NGROK_ADDRESS=$clean_url" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Keep Alive Loop
+        run: |
+          $end = (Get-Date).AddMinutes([int]"${{ env.RUNTIME_MINUTES }}")
+          while ((Get-Date) -lt $end) {
+            Write-Host "RDP Address is still: ${{ env.NGROK_ADDRESS }} - $((Get-Date).ToString())"
+            Start-Sleep -Seconds 60
+          }
