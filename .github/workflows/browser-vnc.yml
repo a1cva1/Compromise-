@@ -36,7 +36,8 @@ jobs:
           $vncMsi = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest $vncUrl -OutFile $vncMsi
 
-          $vncPassword = "Bullet@12345"   # আপনি চাইলে বদলাতে পারেন
+          $vncPassword = "Bullet@12345"
+          "VNC_PASSWORD=$vncPassword" | Out-File -Append $env:GITHUB_ENV
 
           $args = @(
             "/i", "`"$vncMsi`"",
@@ -66,34 +67,50 @@ jobs:
           Expand-Archive $novncZip -DestinationPath "$env:TEMP\novnc"
           $novncDir = "$env:TEMP\novnc\noVNC-1.4.0"
 
-          # Start websockify serving noVNC web files and proxying VNC
           Start-Process python -ArgumentList "-m","websockify","--web",$novncDir,"8080","localhost:5900" -NoNewWindow
 
-      - name: Start Cloudflare Quick Tunnel
+      - name: Start Cloudflare Quick Tunnel and Capture URL
         run: |
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $cfExe = "$env:TEMP\cloudflared.exe"
           Invoke-WebRequest $cfUrl -OutFile $cfExe
 
-          # Quick Tunnel: কোনো token লাগে না, random URL দেয়
-          $proc = Start-Process $cfExe -ArgumentList "tunnel","--url","http://localhost:8080","--no-autoupdate" -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\cf_stdout.log" -RedirectStandardError "$env:TEMP\cf_stderr.log"
+          $stdoutLog = "$env:TEMP\cf_stdout.log"
+          $stderrLog = "$env:TEMP\cf_stderr.log"
+          Remove-Item $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
 
-          # URL capture করার জন্য কিছুক্ষণ অপেক্ষা
-          Start-Sleep -Seconds 15
-          $urlLine = Get-Content "$env:TEMP\cf_stdout.log" | Select-String -Pattern "https://.*trycloudflare.com" | Select-Object -First 1
-          if ($urlLine) {
-              $tunnelUrl = $urlLine.Matches.Value
+          $proc = Start-Process $cfExe -ArgumentList "tunnel","--url","http://localhost:8080","--no-autoupdate" -NoNewWindow -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+
+          $tunnelUrl = $null
+          for ($i = 0; $i -lt 12; $i++) {
+              Start-Sleep -Seconds 5
+              $allOutput = @()
+              if (Test-Path $stdoutLog) { $allOutput += Get-Content $stdoutLog -Raw }
+              if (Test-Path $stderrLog) { $allOutput += Get-Content $stderrLog -Raw }
+              $match = $allOutput | Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" -AllMatches | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
+              if ($match) {
+                  $tunnelUrl = $match
+                  break
+              }
+              if ($proc.HasExited) { break }
+          }
+
+          if ($tunnelUrl) {
               "TUNNEL_URL=$tunnelUrl" | Out-File -Append $env:GITHUB_ENV
               Write-Host "=============================================="
               Write-Host "🌐 YOUR ACCESS URL: $tunnelUrl"
-              Write-Host "👤 VNC Password: Bullet@12345 (or as set)"
+              Write-Host "👤 VNC Password: $env:VNC_PASSWORD"
               Write-Host "=============================================="
           } else {
-              Write-Host "❌ Quick Tunnel URL পাওয়া যায়নি। cf_stdout.log দেখুন:"
-              Get-Content "$env:TEMP\cf_stdout.log"
+              Write-Host "❌ Quick Tunnel URL পাওয়া যায়নি। নিচের log দেখুন:"
+              Write-Host "--- STDOUT ---"
+              if (Test-Path $stdoutLog) { Get-Content $stdoutLog }
+              Write-Host "--- STDERR ---"
+              if (Test-Path $stderrLog) { Get-Content $stderrLog }
+              Write-Host "cloudflared প্রসেস বন্ধ হয়ে থাকতে পারে।"
+              exit 1
           }
 
-          # cloudflared প্রসেস ID save
           "CF_PID=$($proc.Id)" | Out-File -Append $env:GITHUB_ENV
 
       - name: Keep Alive Loop (URL সহ)
@@ -103,7 +120,7 @@ jobs:
               Write-Host "=============================================="
               Write-Host "🟢 Session Active Until: $end"
               Write-Host "🌐 Access URL: $env:TUNNEL_URL"
-              Write-Host "👤 VNC Password: Bullet@12345"
+              Write-Host "👤 VNC Password: $env:VNC_PASSWORD"
               Write-Host "=============================================="
               Start-Sleep -Seconds 60
           }
