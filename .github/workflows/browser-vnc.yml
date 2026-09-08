@@ -1,4 +1,4 @@
-name: Browser VNC (Quick Tunnel - Fixed)
+name: Browser VNC (Quick Tunnel - Super Stable)
 
 on:
   workflow_dispatch:
@@ -52,27 +52,12 @@ jobs:
           )
           Start-Process msiexec.exe -ArgumentList $args -Wait
 
-          # Ensure service is running
           Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
           Set-Service -Name "tvnserver" -StartupType Automatic
 
-          # Open firewall port 5900
           New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP -LocalPort 5900 -Action Allow
 
-          # Check if VNC server is listening on 5900
-          $vncOk = $false
-          for ($i=0; $i -lt 6; $i++) {
-            if (Test-NetConnection -ComputerName localhost -Port 5900 -InformationLevel Quiet) {
-              $vncOk = $true
-              break
-            }
-            Start-Sleep -Seconds 5
-          }
-          if (-not $vncOk) {
-            Write-Host "⚠️ TightVNC server port 5900 not responding yet. Continuing anyway..."
-          } else {
-            Write-Host "✅ TightVNC server is listening on port 5900."
-          }
+          Write-Host "✅ TightVNC installed and service started."
 
       - name: Install noVNC and websockify
         run: |
@@ -85,35 +70,59 @@ jobs:
           $novncDir = "$env:TEMP\novnc\noVNC-1.4.0"
           "NOVNC_DIR=$novncDir" | Out-File -Append $env:GITHUB_ENV
 
-          # Start websockify with log capture
+          Write-Host "noVNC extracted to $novncDir"
+
+      - name: Start websockify (noVNC server)
+        run: |
+          $novncDir = $env:NOVNC_DIR
+
+          # Work from the noVNC directory to avoid path issues
+          Push-Location $novncDir
+
           $wsLog = "$env:TEMP\websockify.log"
           $wsErr = "$env:TEMP\websockify_err.log"
           Remove-Item $wsLog, $wsErr -ErrorAction SilentlyContinue
 
-          $proc = Start-Process python -ArgumentList "-m","websockify","--web","`"$novncDir`"","8080","localhost:5900" -NoNewWindow -PassThru -RedirectStandardOutput $wsLog -RedirectStandardError $wsErr
+          # Start websockify: serves noVNC web files and proxies VNC
+          $proc = Start-Process python -ArgumentList "-m","websockify","--web",".","8080","localhost:5900" -NoNewWindow -PassThru -RedirectStandardOutput $wsLog -RedirectStandardError $wsErr
 
-          # Wait and check if port 8080 is open
+          Pop-Location
+
+          # Wait for port 8080 to open (up to 60 seconds)
           $wsOk = $false
           for ($i=0; $i -lt 12; $i++) {
-            Start-Sleep -Seconds 5
-            if (Test-NetConnection -ComputerName localhost -Port 8080 -InformationLevel Quiet) {
-              $wsOk = $true
-              break
-            }
-            if ($proc.HasExited) {
-              break
-            }
+              Start-Sleep -Seconds 5
+              if (Test-NetConnection -ComputerName localhost -Port 8080 -InformationLevel Quiet) {
+                  $wsOk = $true
+                  break
+              }
+              if ($proc.HasExited) {
+                  break
+              }
           }
 
           if ($wsOk) {
-            Write-Host "✅ noVNC/websockify is running on port 8080."
+              Write-Host "✅ noVNC/websockify is running on port 8080."
+              # Save process ID
+              "WS_PID=$($proc.Id)" | Out-File -Append $env:GITHUB_ENV
           } else {
-            Write-Host "❌ noVNC/websockify failed to start. Showing logs:"
-            Write-Host "--- STDOUT ---"
-            if (Test-Path $wsLog) { Get-Content $wsLog }
-            Write-Host "--- STDERR ---"
-            if (Test-Path $wsErr) { Get-Content $wsErr }
-            exit 1
+              Write-Host "❌ noVNC/websockify failed to start. Showing logs:"
+              Write-Host "--- STDOUT ---"
+              if (Test-Path $wsLog) { Get-Content $wsLog }
+              Write-Host "--- STDERR ---"
+              if (Test-Path $wsErr) { Get-Content $wsErr }
+              exit 1
+          }
+
+      - name: Local test noVNC (HTTP)
+        run: |
+          try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8080" -UseBasicParsing -TimeoutSec 10
+              Write-Host "✅ noVNC HTTP responded with status: $($response.StatusCode)"
+          } catch {
+              Write-Host "❌ Failed to get HTTP response from localhost:8080"
+              Write-Host $_.Exception.Message
+              exit 1
           }
 
       - name: Start Cloudflare Quick Tunnel and Capture URL
