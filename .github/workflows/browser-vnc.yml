@@ -1,4 +1,4 @@
-name: Browser VNC (Cloudflare Tunnel + noVNC)
+name: Browser VNC (Quick Tunnel)
 
 on:
   workflow_dispatch:
@@ -36,25 +36,24 @@ jobs:
           $vncMsi = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest $vncUrl -OutFile $vncMsi
 
-          # Silent install with password
+          $vncPassword = "Bullet@12345"   # আপনি চাইলে বদলাতে পারেন
+
           $args = @(
             "/i", "`"$vncMsi`"",
             "/quiet", "/norestart",
             "ADDLOCAL=Server",
             "SET_USEVNCAUTHENTICATION=1",
             "VALUE_OF_USEVNCAUTHENTICATION=1",
-            "SET_PASSWORD=${{ secrets.VNC_PASSWORD }}",
-            "VALUE_OF_PASSWORD=${{ secrets.VNC_PASSWORD }}",
-            "SET_VIEWONLYPASSWORD=${{ secrets.VNC_PASSWORD }}",
-            "VALUE_OF_VIEWONLYPASSWORD=${{ secrets.VNC_PASSWORD }}"
+            "SET_PASSWORD=$vncPassword",
+            "VALUE_OF_PASSWORD=$vncPassword",
+            "SET_VIEWONLYPASSWORD=$vncPassword",
+            "VALUE_OF_VIEWONLYPASSWORD=$vncPassword"
           )
           Start-Process msiexec.exe -ArgumentList $args -Wait
 
-          # Ensure service is running
           Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
           Set-Service -Name "tvnserver" -StartupType Automatic
 
-          # Open firewall port 5900
           New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP -LocalPort 5900 -Action Allow
 
       - name: Install noVNC and websockify
@@ -70,24 +69,41 @@ jobs:
           # Start websockify serving noVNC web files and proxying VNC
           Start-Process python -ArgumentList "-m","websockify","--web",$novncDir,"8080","localhost:5900" -NoNewWindow
 
-      - name: Install and run Cloudflare Tunnel
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Start Cloudflare Quick Tunnel
         run: |
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $cfExe = "$env:TEMP\cloudflared.exe"
           Invoke-WebRequest $cfUrl -OutFile $cfExe
 
-          # Start tunnel (token already in env)
-          Start-Process $cfExe -ArgumentList "tunnel","run","--token",$env:CF_TUNNEL_TOKEN -NoNewWindow
+          # Quick Tunnel: কোনো token লাগে না, random URL দেয়
+          $proc = Start-Process $cfExe -ArgumentList "tunnel","--url","http://localhost:8080","--no-autoupdate" -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\cf_stdout.log" -RedirectStandardError "$env:TEMP\cf_stderr.log"
 
-          Start-Sleep -Seconds 5
-          Write-Host "Cloudflare Tunnel started. Use your configured public hostname to access."
+          # URL capture করার জন্য কিছুক্ষণ অপেক্ষা
+          Start-Sleep -Seconds 15
+          $urlLine = Get-Content "$env:TEMP\cf_stdout.log" | Select-String -Pattern "https://.*trycloudflare.com" | Select-Object -First 1
+          if ($urlLine) {
+              $tunnelUrl = $urlLine.Matches.Value
+              "TUNNEL_URL=$tunnelUrl" | Out-File -Append $env:GITHUB_ENV
+              Write-Host "=============================================="
+              Write-Host "🌐 YOUR ACCESS URL: $tunnelUrl"
+              Write-Host "👤 VNC Password: Bullet@12345 (or as set)"
+              Write-Host "=============================================="
+          } else {
+              Write-Host "❌ Quick Tunnel URL পাওয়া যায়নি। cf_stdout.log দেখুন:"
+              Get-Content "$env:TEMP\cf_stdout.log"
+          }
 
-      - name: Keep alive
+          # cloudflared প্রসেস ID save
+          "CF_PID=$($proc.Id)" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Keep Alive Loop (URL সহ)
         run: |
           $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
           while ((Get-Date) -lt $end) {
-            Write-Host "Session active until $end"
-            Start-Sleep -Seconds 60
+              Write-Host "=============================================="
+              Write-Host "🟢 Session Active Until: $end"
+              Write-Host "🌐 Access URL: $env:TUNNEL_URL"
+              Write-Host "👤 VNC Password: Bullet@12345"
+              Write-Host "=============================================="
+              Start-Sleep -Seconds 60
           }
