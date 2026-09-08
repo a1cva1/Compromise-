@@ -1,0 +1,93 @@
+name: Browser VNC (Cloudflare Tunnel + noVNC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Runtime in minutes (max 360)"
+        required: false
+        default: "355"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  browser-vnc:
+    runs-on: windows-latest
+    timeout-minutes: 370
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set runtime
+        run: |
+          $rt = [int]"${{ github.event.inputs.runtime_minutes }}"
+          if ($rt -lt 5) { $rt = 355 }
+          "RUNTIME_MINUTES=$rt" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Install TightVNC Server
+        run: |
+          $vncUrl = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
+          $vncMsi = "$env:TEMP\tightvnc.msi"
+          Invoke-WebRequest $vncUrl -OutFile $vncMsi
+
+          # Silent install with password
+          $args = @(
+            "/i", "`"$vncMsi`"",
+            "/quiet", "/norestart",
+            "ADDLOCAL=Server",
+            "SET_USEVNCAUTHENTICATION=1",
+            "VALUE_OF_USEVNCAUTHENTICATION=1",
+            "SET_PASSWORD=${{ secrets.VNC_PASSWORD }}",
+            "VALUE_OF_PASSWORD=${{ secrets.VNC_PASSWORD }}",
+            "SET_VIEWONLYPASSWORD=${{ secrets.VNC_PASSWORD }}",
+            "VALUE_OF_VIEWONLYPASSWORD=${{ secrets.VNC_PASSWORD }}"
+          )
+          Start-Process msiexec.exe -ArgumentList $args -Wait
+
+          # Ensure service is running
+          Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          Set-Service -Name "tvnserver" -StartupType Automatic
+
+          # Open firewall port 5900
+          New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP -LocalPort 5900 -Action Allow
+
+      - name: Install noVNC and websockify
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+
+          $novncZip = "$env:TEMP\novnc.zip"
+          Invoke-WebRequest "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile $novncZip
+          Expand-Archive $novncZip -DestinationPath "$env:TEMP\novnc"
+          $novncDir = "$env:TEMP\novnc\noVNC-1.4.0"
+
+          # Start websockify serving noVNC web files and proxying VNC
+          Start-Process python -ArgumentList "-m","websockify","--web",$novncDir,"8080","localhost:5900" -NoNewWindow
+
+      - name: Install and run Cloudflare Tunnel
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cfExe = "$env:TEMP\cloudflared.exe"
+          Invoke-WebRequest $cfUrl -OutFile $cfExe
+
+          # Start tunnel (token already in env)
+          Start-Process $cfExe -ArgumentList "tunnel","run","--token",$env:CF_TUNNEL_TOKEN -NoNewWindow
+
+          Start-Sleep -Seconds 5
+          Write-Host "Cloudflare Tunnel started. Use your configured public hostname to access."
+
+      - name: Keep alive
+        run: |
+          $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
+          while ((Get-Date) -lt $end) {
+            Write-Host "Session active until $end"
+            Start-Sleep -Seconds 60
+          }
