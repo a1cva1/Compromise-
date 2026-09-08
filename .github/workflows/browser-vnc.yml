@@ -1,4 +1,4 @@
-name: Browser VNC (Quick Tunnel)
+name: Browser VNC (Quick Tunnel - Fixed)
 
 on:
   workflow_dispatch:
@@ -52,10 +52,27 @@ jobs:
           )
           Start-Process msiexec.exe -ArgumentList $args -Wait
 
+          # Ensure service is running
           Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
           Set-Service -Name "tvnserver" -StartupType Automatic
 
+          # Open firewall port 5900
           New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP -LocalPort 5900 -Action Allow
+
+          # Check if VNC server is listening on 5900
+          $vncOk = $false
+          for ($i=0; $i -lt 6; $i++) {
+            if (Test-NetConnection -ComputerName localhost -Port 5900 -InformationLevel Quiet) {
+              $vncOk = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $vncOk) {
+            Write-Host "⚠️ TightVNC server port 5900 not responding yet. Continuing anyway..."
+          } else {
+            Write-Host "✅ TightVNC server is listening on port 5900."
+          }
 
       - name: Install noVNC and websockify
         run: |
@@ -66,8 +83,38 @@ jobs:
           Invoke-WebRequest "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile $novncZip
           Expand-Archive $novncZip -DestinationPath "$env:TEMP\novnc"
           $novncDir = "$env:TEMP\novnc\noVNC-1.4.0"
+          "NOVNC_DIR=$novncDir" | Out-File -Append $env:GITHUB_ENV
 
-          Start-Process python -ArgumentList "-m","websockify","--web",$novncDir,"8080","localhost:5900" -NoNewWindow
+          # Start websockify with log capture
+          $wsLog = "$env:TEMP\websockify.log"
+          $wsErr = "$env:TEMP\websockify_err.log"
+          Remove-Item $wsLog, $wsErr -ErrorAction SilentlyContinue
+
+          $proc = Start-Process python -ArgumentList "-m","websockify","--web","`"$novncDir`"","8080","localhost:5900" -NoNewWindow -PassThru -RedirectStandardOutput $wsLog -RedirectStandardError $wsErr
+
+          # Wait and check if port 8080 is open
+          $wsOk = $false
+          for ($i=0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 5
+            if (Test-NetConnection -ComputerName localhost -Port 8080 -InformationLevel Quiet) {
+              $wsOk = $true
+              break
+            }
+            if ($proc.HasExited) {
+              break
+            }
+          }
+
+          if ($wsOk) {
+            Write-Host "✅ noVNC/websockify is running on port 8080."
+          } else {
+            Write-Host "❌ noVNC/websockify failed to start. Showing logs:"
+            Write-Host "--- STDOUT ---"
+            if (Test-Path $wsLog) { Get-Content $wsLog }
+            Write-Host "--- STDERR ---"
+            if (Test-Path $wsErr) { Get-Content $wsErr }
+            exit 1
+          }
 
       - name: Start Cloudflare Quick Tunnel and Capture URL
         run: |
