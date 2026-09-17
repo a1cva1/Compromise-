@@ -1,0 +1,100 @@
+name: Tailscale VNC (Browser Access - Logs Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:         { description: "Paste your Tailscale Auth key", required: true }
+      runtime_minutes:    { description: "Runtime in minutes (max 360)", required: false, default: "355" }
+      vnc_password:       { description: "VNC Password (default: Bullet@12345)", required: false, default: "Bullet@12345" }
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  vnc:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    env:
+      VNC_PASS: ${{ inputs.vnc_password }}
+
+    steps:
+      - name: Runtime Setup
+        run: |
+          $rt = [int]"${{ inputs.runtime_minutes }}"; if ($rt -lt 5) { $rt = 355 }
+          "RUNTIME_MINUTES=$rt" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Create Windows User
+        run: |
+          $u = "Bullettemporary"
+          $p = "Bullet@12345"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) { 
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember "Administrators" $u
+          }
+
+      - name: Install TightVNC
+        run: |
+          $msi = "$env:TEMP\tightvnc.msi"
+          Invoke-WebRequest "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" -OutFile $msi
+          $msiArgs = @(
+            "/i", "`"$msi`"",
+            "/quiet", "/norestart",
+            "ADDLOCAL=Server",
+            "SET_USEVNCAUTHENTICATION=1",
+            "VALUE_OF_USEVNCAUTHENTICATION=1",
+            "SET_PASSWORD=1",
+            "VALUE_OF_PASSWORD=$env:VNC_PASS",
+            "SET_ALLOWLOOPBACK=1",
+            "VALUE_OF_ALLOWLOOPBACK=1",
+            "SET_ACCEPTSOCKETCONNECTIONS=1",
+            "VALUE_OF_ACCEPTSOCKETCONNECTIONS=1"
+          )
+          Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+          Start-Sleep -Seconds 10
+          Start-Service tvnserver -ErrorAction SilentlyContinue
+
+      - name: Install Python websockify and noVNC
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+          git clone https://github.com/novnc/noVNC.git "$env:TEMP\noVNC"
+
+      - name: Tailscale Installation & Connection
+        run: |
+          $dst = "$env:TEMP\ts.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $dst
+          Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+          Start-Sleep -Seconds 5
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-pc" --accept-dns=true --accept-routes=true --unattended --reset
+          
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          "TAILSCALE_IP=$ip" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Start noVNC (websockify)
+        run: |
+          $novnc = "$env:TEMP\noVNC"
+          Start-Process python -ArgumentList "-m websockify --web `"$novnc`" 6080 localhost:5900" -NoNewWindow
+          Start-Sleep -Seconds 5
+          
+          $url = "http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
+          Write-Host "================================================--"
+          Write-Host "🟢 VNC IS READY VIA BROWSER (noVNC over Tailscale)!"
+          Write-Host "🌐 URL: $url"
+          Write-Host "🔑 VNC Password: $env:VNC_PASS"
+          Write-Host "👤 Windows User: Bullettemporary / Bullet@12345"
+          Write-Host "================================================--"
+          "VNC_URL=$url" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Keep Alive Loop
+        run: |
+          $end = (Get-Date).AddMinutes([int]"${{ env.RUNTIME_MINUTES }}")
+          while ((Get-Date) -lt $end) {
+            Write-Host "VNC URL: ${{ env.VNC_URL }} - $((Get-Date).ToString())"
+            Start-Sleep -Seconds 60
+          }
