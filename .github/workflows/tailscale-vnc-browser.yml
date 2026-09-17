@@ -1,11 +1,11 @@
-name: Tailscale VNC (Browser Access via tailscale serve)
+name: Tailscale VNC (Serve - Single Step Keepalive)
 
 on:
   workflow_dispatch:
     inputs:
       ts_authkey:         { description: "Paste your Tailscale Auth key", required: true }
       runtime_minutes:    { description: "Runtime in minutes (max 360)", required: false, default: "355" }
-      vnc_password:       { description: "VNC Password (default: Bullet@12345)", required: false, default: "Bullet@12345" }
+      vnc_password:       { description: "VNC Password", required: false, default: "Bullet@12345" }
 
 permissions:
   contents: read
@@ -29,10 +29,9 @@ jobs:
 
       - name: Create Windows User
         run: |
-          $u = "Bullettemporary"
-          $p = "Bullet@12345"
+          $u = "Bullettemporary"; $p = "Bullet@12345"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) { 
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
             New-LocalUser -Name $u -Password $sec -AccountNeverExpires
             Add-LocalGroupMember "Administrators" $u
           }
@@ -41,20 +40,14 @@ jobs:
         run: |
           $msi = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" -OutFile $msi
-          $msiArgs = @(
-            "/i", "`"$msi`"",
-            "/quiet", "/norestart",
+          Start-Process msiexec.exe -ArgumentList @(
+            "/i","`"$msi`"","/quiet","/norestart",
             "ADDLOCAL=Server",
-            "SET_USEVNCAUTHENTICATION=1",
-            "VALUE_OF_USEVNCAUTHENTICATION=1",
-            "SET_PASSWORD=1",
-            "VALUE_OF_PASSWORD=$env:VNC_PASS",
-            "SET_ALLOWLOOPBACK=1",
-            "VALUE_OF_ALLOWLOOPBACK=1",
-            "SET_ACCEPTSOCKETCONNECTIONS=1",
-            "VALUE_OF_ACCEPTSOCKETCONNECTIONS=1"
-          )
-          Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+            "SET_USEVNCAUTHENTICATION=1","VALUE_OF_USEVNCAUTHENTICATION=1",
+            "SET_PASSWORD=1","VALUE_OF_PASSWORD=$env:VNC_PASS",
+            "SET_ALLOWLOOPBACK=1","VALUE_OF_ALLOWLOOPBACK=1",
+            "SET_ACCEPTSOCKETCONNECTIONS=1","VALUE_OF_ACCEPTSOCKETCONNECTIONS=1"
+          ) -Wait
           Start-Sleep -Seconds 15
           Start-Service tvnserver -ErrorAction SilentlyContinue
 
@@ -64,71 +57,66 @@ jobs:
           python -m pip install websockify
           git clone --depth 1 https://github.com/novnc/noVNC.git "$env:TEMP\noVNC"
 
-      - name: Tailscale Installation & Connection
+      - name: Tailscale Install & Connect
         run: |
           $dst = "$env:TEMP\ts.msi"
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $dst
           Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
           Start-Sleep -Seconds 5
-          
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-pc" --accept-dns=true --accept-routes=true --unattended --reset
-          
           Start-Sleep -Seconds 10
           $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) | Select-Object -First 1
-          $ip = $ip.Trim()
-          "TAILSCALE_IP=$ip" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $ip"
-          
-          Write-Host "--- Tailscale status ---"
+          "TAILSCALE_IP=$($ip.Trim())" | Out-File -Append $env:GITHUB_ENV
           & "$env:ProgramFiles\Tailscale\tailscale.exe" status
 
-      - name: Disable Firewall (runner only)
+      - name: Disable Firewall
         run: |
           Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
-          New-NetFirewallRule -DisplayName "VNC-all" -Direction Inbound -Protocol TCP -LocalPort 5900,6080 -Action Allow -Profile Any -ErrorAction SilentlyContinue
 
-      - name: Start noVNC websockify
+      # =========================================================
+      # একটাই স্টেপে: websockify + tailscale serve + keep-alive
+      # =========================================================
+      - name: Run VNC + Serve + Keep-Alive (single session)
         run: |
           $novnc = "$env:TEMP\noVNC"
-          Start-Process python -ArgumentList "-m websockify --web `"$novnc`" 0.0.0.0:6080 localhost:5900" -NoNewWindow
-          Start-Sleep -Seconds 8
-          
-          Write-Host "--- netstat 6080 ---"
-          netstat -ano | findstr :6080
-          Write-Host "--- netstat 5900 ---"
-          netstat -ano | findstr :5900
+          $ts    = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-      - name: Expose via tailscale serve
-        run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          
-          # Serve port 6080 over Tailscale HTTPS (port 443)
+          # --- Start websockify ---
+          $wsk = Start-Process python `
+            -ArgumentList "-m websockify --web `"$novnc`" 0.0.0.0:6080 localhost:5900" `
+            -PassThru -NoNewWindow
+          Write-Host "websockify PID: $($wsk.Id)"
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- netstat 6080 ---"; netstat -ano | findstr :6080
+          Write-Host "--- netstat 5900 ---"; netstat -ano | findstr :5900
+
+          # --- Test localhost ---
+          try {
+            $r = Invoke-WebRequest "http://localhost:6080/vnc.html" -UseBasicParsing -TimeoutSec 5
+            Write-Host "localhost test: $($r.StatusCode)"
+          } catch { Write-Host "localhost test FAILED: $_" }
+
+          # --- tailscale serve ---
+          Write-Host "--- Enabling tailscale serve ---"
           & $ts serve --bg --https=443 http://localhost:6080
-          
           Start-Sleep -Seconds 5
-          
-          Write-Host "--- tailscale serve status ---"
+          Write-Host "--- serve status ---"
           & $ts serve status
-          
-          # Get the tailnet DNS name
-          $dns = (& $ts status --json | ConvertFrom-Json).Self.DNSName
-          $dns = $dns.TrimEnd('.')
-          
+
+          # --- Build URL ---
+          $dns = ((& $ts status --json | ConvertFrom-Json).Self.DNSName).TrimEnd('.')
           $url = "https://$dns/vnc.html"
-          
           Write-Host "================================================--"
-          Write-Host "🟢 VNC READY (via tailscale serve over HTTPS)"
           Write-Host "🌐 URL: $url"
           Write-Host "🔑 VNC Password: $env:VNC_PASS"
-          Write-Host "👤 Windows User: Bullettemporary / Bullet@12345"
           Write-Host "================================================--"
-          
-          "VNC_URL=$url" | Out-File -Append $env:GITHUB_ENV
 
-      - name: Keep Alive Loop
-        run: |
-          $end = (Get-Date).AddMinutes([int]"${{ env.RUNTIME_MINUTES }}")
+          # --- Keep Alive (websockify এই session-এ বেঁচে থাকবে) ---
+          $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
           while ((Get-Date) -lt $end) {
-            Write-Host "VNC URL: ${{ env.VNC_URL }} - $((Get-Date).ToString())"
+            $alive = $false
+            try { $wsk.HasExited | Out-Null; $alive = -not $wsk.HasExited } catch {}
+            Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] URL: $url  | websockify alive: $alive"
             Start-Sleep -Seconds 60
           }
