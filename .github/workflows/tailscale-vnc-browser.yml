@@ -1,4 +1,4 @@
-name: Tailscale VNC (Browser Access - Logs Only)
+name: Tailscale VNC (Browser Access via tailscale serve)
 
 on:
   workflow_dispatch:
@@ -55,14 +55,14 @@ jobs:
             "VALUE_OF_ACCEPTSOCKETCONNECTIONS=1"
           )
           Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 15
           Start-Service tvnserver -ErrorAction SilentlyContinue
 
       - name: Install Python websockify and noVNC
         run: |
           python -m pip install --upgrade pip
           python -m pip install websockify
-          git clone https://github.com/novnc/noVNC.git "$env:TEMP\noVNC"
+          git clone --depth 1 https://github.com/novnc/noVNC.git "$env:TEMP\noVNC"
 
       - name: Tailscale Installation & Connection
         run: |
@@ -73,22 +73,56 @@ jobs:
           
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-pc" --accept-dns=true --accept-routes=true --unattended --reset
           
-          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Start-Sleep -Seconds 10
+          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) | Select-Object -First 1
+          $ip = $ip.Trim()
           "TAILSCALE_IP=$ip" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+          
+          Write-Host "--- Tailscale status ---"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
 
-      - name: Start noVNC (websockify)
+      - name: Disable Firewall (runner only)
+        run: |
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "VNC-all" -Direction Inbound -Protocol TCP -LocalPort 5900,6080 -Action Allow -Profile Any -ErrorAction SilentlyContinue
+
+      - name: Start noVNC websockify
         run: |
           $novnc = "$env:TEMP\noVNC"
-          Start-Process python -ArgumentList "-m websockify --web `"$novnc`" 6080 localhost:5900" -NoNewWindow
+          Start-Process python -ArgumentList "-m websockify --web `"$novnc`" 0.0.0.0:6080 localhost:5900" -NoNewWindow
+          Start-Sleep -Seconds 8
+          
+          Write-Host "--- netstat 6080 ---"
+          netstat -ano | findstr :6080
+          Write-Host "--- netstat 5900 ---"
+          netstat -ano | findstr :5900
+
+      - name: Expose via tailscale serve
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          # Serve port 6080 over Tailscale HTTPS (port 443)
+          & $ts serve --bg --https=443 http://localhost:6080
+          
           Start-Sleep -Seconds 5
           
-          $url = "http://${{ env.TAILSCALE_IP }}:6080/vnc.html"
+          Write-Host "--- tailscale serve status ---"
+          & $ts serve status
+          
+          # Get the tailnet DNS name
+          $dns = (& $ts status --json | ConvertFrom-Json).Self.DNSName
+          $dns = $dns.TrimEnd('.')
+          
+          $url = "https://$dns/vnc.html"
+          
           Write-Host "================================================--"
-          Write-Host "🟢 VNC IS READY VIA BROWSER (noVNC over Tailscale)!"
+          Write-Host "🟢 VNC READY (via tailscale serve over HTTPS)"
           Write-Host "🌐 URL: $url"
           Write-Host "🔑 VNC Password: $env:VNC_PASS"
           Write-Host "👤 Windows User: Bullettemporary / Bullet@12345"
           Write-Host "================================================--"
+          
           "VNC_URL=$url" | Out-File -Append $env:GITHUB_ENV
 
       - name: Keep Alive Loop
