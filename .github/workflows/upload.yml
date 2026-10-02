@@ -1,13 +1,12 @@
 name: Upload nid.zip to D1
 
 on:
-  # শুধু manual run
   workflow_dispatch:
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       - name: 📥 Checkout repo
