@@ -1,25 +1,26 @@
 """
-nid.zip থেকে JSON ফাইল বের করে সরাসরি Cloudflare D1-এ insert করে।
-GitHub Actions-এ চলে — কোনো HTTP server দরকার নেই।
+nid.zip → Cloudflare D1 (fast parallel uploader)
 """
 import os
 import sys
 import json
-import time
 import glob
 import zipfile
 import tempfile
 import logging
+import threading
 import requests
 import json5
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("uploader")
 
-# ---------- Credentials (GitHub Secrets থেকে) ----------
+# ---------- Credentials ----------
 CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
 CF_DATABASE_ID = os.environ["CF_DATABASE_ID"]
 CF_API_TOKEN = os.environ["CF_API_TOKEN"]
@@ -31,30 +32,48 @@ D1_URL = (
 
 ZIP_PATH = os.environ.get("ZIP_PATH", "nid.zip")
 
-# ---------- D1 API helpers ----------
-def d1_batch(statements: list) -> dict:
-    """একসাথে অনেক statement পাঠায় (batch API)।"""
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = [{"sql": s["sql"], "params": s["params"]} for s in statements]
-    r = requests.post(D1_URL, headers=headers, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+# ---------- Tuning ----------
+# D1: max 100 bound params per query. Each row = 3 params → max 33.
+# Use 25 to be extra safe (25×3 = 75 params).
+BATCH_SIZE = 25
+MAX_WORKERS = 6
 
-
-def d1_single(sql: str, params: list) -> dict:
+# ---------- D1 helpers ----------
+def d1_post(sql: str, params: list) -> dict:
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
     r = requests.post(
-        D1_URL, headers=headers,
-        json={"sql": sql, "params": params}, timeout=60,
+        D1_URL,
+        headers=headers,
+        json={"sql": sql, "params": params},
+        timeout=120,
     )
-    r.raise_for_status()
+    if not r.ok:
+        # Show the REAL error body from Cloudflare
+        log.error("🚨 D1 %d response: %s", r.status_code, r.text[:500])
+        r.raise_for_status()
     return r.json()
+
+
+def insert_chunk(records: list[dict]) -> int:
+    """
+    এক statement-এ সব row insert করে:
+    INSERT OR REPLACE INTO users (number, nid, dob) VALUES (?,?,?),(?,?,?),...
+    """
+    if not records:
+        return 0
+
+    placeholders = ",".join(["(?, ?, ?)"] * len(records))
+    sql = f"INSERT OR REPLACE INTO users (number, nid, dob) VALUES {placeholders}"
+
+    params = []
+    for r in records:
+        params.extend([r["number"], r["nid"], r["dob"]])
+
+    d1_post(sql, params)
+    return len(records)
 
 
 # ---------- Tolerant JSON parser ----------
@@ -62,6 +81,7 @@ def parse_records(raw_text: str) -> list[dict]:
     raw_text = raw_text.strip()
     if not raw_text:
         return []
+
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -87,42 +107,57 @@ def parse_records(raw_text: str) -> list[dict]:
         nid = str(item.get("nid", "")).strip()
         dob = str(item.get("dob", "")).strip()
         if not (number and nid and dob):
-            log.warning("  Row %d বাদ — অসম্পূর্ণ: %s", i, item)
             continue
         cleaned.append({"number": number, "nid": nid, "dob": dob})
     return cleaned
 
 
-# ---------- Batch insert ----------
-BATCH_SIZE = 50
-SQL = "INSERT OR REPLACE INTO users (number, nid, dob) VALUES (?, ?, ?)"
+# ---------- Parallel insert ----------
+progress_lock = threading.Lock()
+_abort = threading.Event()
 
 
-def insert_records(records: list[dict]) -> tuple[int, int]:
-    inserted, failed = 0, 0
+def insert_parallel(records: list[dict]) -> tuple[int, int]:
     total = len(records)
-    for i in range(0, total, BATCH_SIZE):
-        chunk = records[i : i + BATCH_SIZE]
-        statements = [
-            {"sql": SQL, "params": [r["number"], r["nid"], r["dob"]]}
-            for r in chunk
-        ]
-        try:
-            d1_batch(statements)
-            inserted += len(chunk)
-        except Exception as e:
-            log.error("  Batch fail: %s — single retry", e)
-            for s in statements:
-                try:
-                    d1_single(s["sql"], s["params"])
-                    inserted += 1
-                except Exception as e2:
-                    failed += 1
-                    log.error("  Single fail: %s", e2)
+    if total == 0:
+        return 0, 0
 
-        pct = int(inserted / total * 100) if total else 100
-        bar = "█" * (pct // 2) + "░" * (50 - pct // 2)
-        log.info(f"  [{bar}] {pct}% ({inserted}/{total})")
+    chunks = [records[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+    log.info("📤 %d row → %d batch (প্রতি batch-এ %d row), %d parallel worker",
+             total, len(chunks), BATCH_SIZE, MAX_WORKERS)
+
+    inserted = 0
+    failed = 0
+    first_error_shown = False
+
+    def submit_one(chunk):
+        # abort signal এলে skip
+        if _abort.is_set():
+            return 0
+        return insert_chunk(chunk)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(submit_one, c): c for c in chunks}
+        for f in as_completed(futures):
+            chunk = futures[f]
+            try:
+                n = f.result()
+                with progress_lock:
+                    inserted += n
+            except Exception as e:
+                with progress_lock:
+                    failed += len(chunk)
+                    # প্রথম error-এ abort flag set — বাকিগুলো থেমে যাবে
+                    if not first_error_shown:
+                        first_error_shown = True
+                        log.error("❌ প্রথম batch fail — বাকি সব বাতিল। কারণ: %s", e)
+                        _abort.set()
+
+            with progress_lock:
+                done = inserted + failed
+                pct = int(done / total * 100)
+                bar = "█" * (pct // 2) + "░" * (50 - pct // 2)
+                log.info(f"  [{bar}] {pct}% ({done}/{total}) | ok={inserted} fail={failed}")
 
     return inserted, failed
 
@@ -133,7 +168,8 @@ def main():
         log.error("❌ %s ফাইল পাওয়া যায়নি (repo root-এ রাখুন)", ZIP_PATH)
         sys.exit(1)
 
-    log.info("📦 Zip: %s (%.2f MB)", ZIP_PATH, os.path.getsize(ZIP_PATH) / 1024 / 1024)
+    size_mb = os.path.getsize(ZIP_PATH) / 1024 / 1024
+    log.info("📦 Zip: %s (%.2f MB)", ZIP_PATH, size_mb)
 
     grand_inserted = 0
     grand_failed = 0
@@ -141,7 +177,7 @@ def main():
     file_count = 0
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Zip extract
+        # Extract
         try:
             with zipfile.ZipFile(ZIP_PATH, "r") as zf:
                 zf.extractall(tmpdir)
@@ -150,8 +186,9 @@ def main():
             log.error("❌ Zip extract fail: %s", e)
             sys.exit(1)
 
-        # সব .json খুঁজি (recursive)
-        json_files = sorted(glob.glob(os.path.join(tmpdir, "**", "*.json"), recursive=True))
+        json_files = sorted(
+            glob.glob(os.path.join(tmpdir, "**", "*.json"), recursive=True)
+        )
         if not json_files:
             log.error("❌ Zip-এ কোনো .json ফাইল নেই")
             sys.exit(1)
@@ -160,12 +197,11 @@ def main():
 
         for fp in json_files:
             rel = os.path.relpath(fp, tmpdir)
-            log.info("➡️  প্রসেস: %s", rel)
+            log.info("➡️  %s", rel)
 
             try:
                 with open(fp, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                records = parse_records(raw)
+                    records = parse_records(f.read())
             except Exception as e:
                 log.error("  ❌ Parse fail: %s", e)
                 continue
@@ -174,15 +210,18 @@ def main():
                 log.warning("  ⚠️  কোনো record নেই")
                 continue
 
-            log.info("  📥 %d record পাওয়া গেছে", len(records))
-            inserted, failed = insert_records(records)
+            log.info("  📥 %d record", len(records))
+            ins, fail = insert_parallel(records)
 
-            grand_inserted += inserted
-            grand_failed += failed
+            grand_inserted += ins
+            grand_failed += fail
             grand_total += len(records)
             file_count += 1
 
-            time.sleep(0.5)  # rate limit নিরাপদ
+            # প্রথম ফাইলেই বড় fail হলে বন্ধ করি
+            if _abort.is_set():
+                log.error("🛑 প্রথম ফাইলেই error — বাকি ফাইল skip")
+                break
 
     log.info("=" * 55)
     log.info("🎉 সম্পন্ন!")
